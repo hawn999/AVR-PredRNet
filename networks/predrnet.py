@@ -11,16 +11,44 @@ from .network_utils import (
     convert_to_rpm_matrix_v6
 )
 
+class SelfAttention(nn.Module):
+    def __init__(
+        self,
+        in_planes,
+        dropout = 0.1,
+        num_heads = 8
+    ): 
+        super().__init__()
+        self.q = nn.Linear(in_planes, in_planes)
+        self.kv = nn.Linear(in_planes, in_planes*2)
+        self.num_heads=num_heads
+        self.head_dim=in_planes//num_heads
+        self.m = nn.Linear(in_planes, in_planes)
+        self.drop = nn.Dropout(dropout)
+    
+    def forward(self, x):
+        b,t,l,c = x.shape
+        shortcut = x
+        q = F.normalize(self.q(x).reshape(b, t, l, self.num_heads, self.head_dim).permute(0, 1, 3, 2, 4), dim=-1)
+        k, v = self.kv(x).reshape(b, t, l, self.num_heads*2, self.head_dim).permute(0, 1, 3, 2, 4).chunk(2, dim=2)
+        k, v = F.normalize(k, dim=-1), F.normalize(v, dim=-1)
+
+        atten = self.drop(q @ k.transpose(-2, -1))
+        atten = F.softmax(atten / math.sqrt(self.head_dim), dim=-1)
+        x = (atten @ v)
+
+        x = self.m(x.permute(0,1,3,2,4).reshape(b,t,l,c))+shortcut
+        return x
 
 class PredictiveReasoningBlock(nn.Module):
 
     def __init__(
         self, 
         in_planes, 
-        ou_planes, 
-        downsample, 
+        ou_planes,
+        downsample,
         stride = 1, 
-        dropout = 0.0, 
+        dropout = 0.1, 
         num_contexts = 8
     ):
 
@@ -32,25 +60,34 @@ class PredictiveReasoningBlock(nn.Module):
         self.pconv = ConvNormAct(in_planes, in_planes, (num_contexts, 1))
         self.conv1 = ConvNormAct(in_planes, md_planes, 3, 1)
         self.conv2 = ConvNormAct(md_planes, ou_planes, 3, 1)
+        self.conv = nn.Sequential(ConvNormAct((num_contexts+1), (num_contexts+1)*4, 3, 1), ConvNormAct((num_contexts+1)*4, (num_contexts+1), 3, 1))
         self.drop = nn.Dropout(dropout) if dropout > .0 else nn.Identity()
+        self.lp = nn.Linear(in_planes, in_planes*2)
+        self.m = nn.Linear(in_planes, in_planes)
+        self.m1 = nn.Linear(in_planes, in_planes)
 
         self.downsample = downsample
 
     def forward(self, x):
         
         b, c, t, l = x.size()
+        identity = self.downsample(x)
+        g, x = self.lp(x.permute(0,2,3,1)).chunk(2, dim=-1)
+        g = self.m(self.conv(g.contiguous()))
+        x = x.permute(0,3,1,2).contiguous()
         contexts, choices = x[:,:,:t-1], x[:,:,t-1:]
         predictions = self.pconv(contexts)
         prediction_errors = F.relu(choices) - predictions
         
         out = torch.cat((contexts, prediction_errors), dim=2)
+        out = self.m1(out.permute(0,2,3,1)*F.gelu(g)).permute(0,3,1,2).contiguous()
         out = self.conv1(out)
         out = self.conv2(out)
         out = self.drop(out)
-        identity = self.downsample(x)
         out = out + identity
         
         return out
+
 
 class PredRNet(nn.Module):
 
@@ -79,7 +116,7 @@ class PredRNet(nn.Module):
             )
         # -------------------------------------------------------------------
 
-        
+
 
         # -------------------------------------------------------------------
         # predictive coding 
@@ -155,16 +192,17 @@ class PredRNet(nn.Module):
             x = convert_to_rpm_matrix_v9(x, b, h, w)
         else:
             x = convert_to_rpm_matrix_v6(x, b, h, w)
-        
+
         x = x.reshape(b * self.ou_channels, self.num_contexts + 1, -1, h * w)
         # e.g. [b,9,c,l] -> [b,c,9,l] (l=h*w)
         x = x.permute(0,2,1,3)
 
-        for l in range(0, self.num_extra_stages): 
+        for l in range(0, self.num_extra_stages):
             x = getattr(self, "prb"+str(l))(x)
-  
+
         x = x.reshape(b, self.ou_channels, -1)
-        x = F.adaptive_avg_pool1d(x, self.featr_dims)    
+        x = F.adaptive_avg_pool1d(x, 1024)
+
         x = x.reshape(b * self.ou_channels, self.featr_dims)
 
         out = self.classifier(x)

@@ -1,5 +1,6 @@
 from .resnet4b import resnet4b
-from .predrnet import predrnet_raven, predrnet_analogy
+from .predrnet_raise_model import predrnet_raven, predrnet_analogy
+# from .predrnet import predrnet_raven, predrnet_analogy
 
 model_dict = {
     "resnet4b": resnet4b,
